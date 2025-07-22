@@ -5,11 +5,13 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session as DBSession, relationship
 import datetime
 import enum
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from fastapi import status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from typing import List, Optional
+import jwt
+from datetime import timedelta
 
 DATABASE_URL = "sqlite:///./snooker.db"
 
@@ -35,7 +37,7 @@ class CustomerTypeEnum(str, enum.Enum):
 class RateTypeEnum(str, enum.Enum):
     hourly = "hourly"
     min30 = "30min"
-    custom = "time played"
+    time_played = "time played"
 
 class TableStatusEnum(str, enum.Enum):
     vacant = "vacant"
@@ -123,6 +125,7 @@ class CustomerOut(BaseModel):
     rate_type: str
     rate_amount: float
     discount: float
+    created_at: datetime.datetime
     
     model_config = ConfigDict(from_attributes=True)
 
@@ -171,10 +174,59 @@ def get_all_customers(db: DBSession = Depends(get_db)):
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
+SECRET_KEY = "your-secret-key-here-change-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-@app.post("/admin/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="admin/login")
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return username
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+@app.post("/admin/login", response_model=Token)
 def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
     if form_data.username == ADMIN_USERNAME and form_data.password == ADMIN_PASSWORD:
-        return {"success": True, "message": "Login successful"}
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": form_data.username}, expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
     else:
-        return {"success": False, "message": "Invalid credentials"} 
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+@app.get("/admin/verify")
+def verify_admin(current_user: str = Depends(verify_token)):
+    return {"username": current_user, "authenticated": True} 
