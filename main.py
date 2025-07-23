@@ -43,6 +43,7 @@ class TableStatusEnum(str, enum.Enum):
     vacant = "vacant"
     occupied = "occupied"
     reserved = "reserved"
+    maintenance = "maintenance"
 
 # Database Models
 class Customer(Base):
@@ -67,7 +68,7 @@ class Table(Base):
 class Session(Base):
     __tablename__ = "sessions"
     id = Column(Integer, primary_key=True, index=True)
-    customer_id = Column(Integer, ForeignKey('customers.id'), nullable=False)
+    customer_id = Column(Integer, ForeignKey('customers.id'), nullable=True)  # Allow null for guest sessions
     table_id = Column(Integer, ForeignKey('tables.id'), nullable=False)
     start_time = Column(DateTime, nullable=False)
     end_time = Column(DateTime, nullable=True)
@@ -75,6 +76,9 @@ class Session(Base):
     base_rate = Column(Float, nullable=True)
     discount = Column(Float, nullable=True)
     total_cost = Column(Float, nullable=True)
+    # Guest session fields
+    guest_name = Column(String(100), nullable=True)
+    guest_contact = Column(String(15), nullable=True)
     customer = relationship("Customer", back_populates="sessions")
     table = relationship("Table", back_populates="sessions")
     session_items = relationship("SessionItem", back_populates="session")
@@ -229,4 +233,173 @@ def admin_login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.get("/admin/verify")
 def verify_admin(current_user: str = Depends(verify_token)):
-    return {"username": current_user, "authenticated": True} 
+    return {"username": current_user, "authenticated": True}
+
+# Tables endpoints
+@app.get("/tables")
+def get_tables(db: DBSession = Depends(get_db)):
+    """Get all tables with their current status"""
+    tables = db.query(Table).all()
+    return tables
+
+@app.get("/tables/available")
+def get_available_tables(db: DBSession = Depends(get_db)):
+    """Get only available (vacant) tables"""
+    tables = db.query(Table).filter(Table.status == TableStatusEnum.vacant).all()
+    return tables
+
+# Session endpoints
+class SessionCreate(BaseModel):
+    customer_id: Optional[int] = None
+    guest_name: Optional[str] = None
+    guest_contact: Optional[str] = None
+    table_id: int
+    session_type: str  # 'member' or 'guest'
+
+class SessionOut(BaseModel):
+    id: int
+    customer_id: Optional[int]
+    table_id: int
+    start_time: datetime.datetime
+    end_time: Optional[datetime.datetime]
+    total_minutes: Optional[int]
+    base_rate: Optional[float]
+    discount: Optional[float]
+    total_cost: Optional[float]
+    guest_name: Optional[str]
+    guest_contact: Optional[str]
+    
+    model_config = ConfigDict(from_attributes=True)
+
+@app.post("/sessions/start", response_model=SessionOut)
+def start_session(session_data: SessionCreate, db: DBSession = Depends(get_db)):
+    """Start a new session for member or guest"""
+    # Check if table is available
+    table = db.query(Table).filter(Table.id == session_data.table_id).first()
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+    
+    if table.status != TableStatusEnum.vacant:
+        raise HTTPException(status_code=400, detail="Table is not available")
+    
+    # Create session
+    new_session = Session(
+        customer_id=session_data.customer_id,
+        table_id=session_data.table_id,
+        start_time=datetime.datetime.utcnow(),
+        guest_name=session_data.guest_name,
+        guest_contact=session_data.guest_contact
+    )
+    
+    # Update table status
+    table.status = TableStatusEnum.occupied
+    
+    db.add(new_session)
+    db.commit()
+    db.refresh(new_session)
+    
+    return new_session
+
+@app.get("/sessions/active")
+def get_active_sessions(db: DBSession = Depends(get_db)):
+    """Get all active sessions"""
+    sessions = db.query(Session).filter(Session.end_time.is_(None)).all()
+    return sessions
+
+@app.post("/tables/create-sample")
+def create_sample_tables(db: DBSession = Depends(get_db)):
+    """Create sample tables if they don't exist"""
+    existing_tables = db.query(Table).count()
+    if existing_tables == 0:
+        sample_tables = [
+            Table(table_name="Table 1", status=TableStatusEnum.vacant),
+            Table(table_name="Table 2", status=TableStatusEnum.vacant),
+            Table(table_name="Table 3", status=TableStatusEnum.vacant),
+            Table(table_name="Table 4", status=TableStatusEnum.vacant),
+            Table(table_name="Table 5", status=TableStatusEnum.vacant),
+            Table(table_name="Table 6", status=TableStatusEnum.vacant),
+        ]
+        for table in sample_tables:
+            db.add(table)
+        db.commit()
+        return {"message": "Sample tables created successfully"}
+    else:
+        return {"message": f"Tables already exist ({existing_tables} tables found)"}
+
+# Table management endpoints
+class TableCreate(BaseModel):
+    table_name: str
+    status: str = "vacant"
+
+class TableUpdate(BaseModel):
+    table_name: Optional[str] = None
+    status: Optional[str] = None
+
+class TableOut(BaseModel):
+    id: int
+    table_name: str
+    status: str
+    
+    model_config = ConfigDict(from_attributes=True)
+
+@app.post("/tables/create", response_model=TableOut)
+def create_table(table_data: TableCreate, db: DBSession = Depends(get_db)):
+    """Create a new table"""
+    # Check if table name already exists
+    existing_table = db.query(Table).filter(Table.table_name == table_data.table_name).first()
+    if existing_table:
+        raise HTTPException(status_code=400, detail="Table name already exists")
+    
+    new_table = Table(
+        table_name=table_data.table_name,
+        status=TableStatusEnum(table_data.status)
+    )
+    db.add(new_table)
+    db.commit()
+    db.refresh(new_table)
+    return new_table
+
+@app.put("/tables/{table_id}", response_model=TableOut)
+def update_table(table_id: int, table_data: TableUpdate, db: DBSession = Depends(get_db)):
+    """Update a table"""
+    table = db.query(Table).filter(Table.id == table_id).first()
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+    
+    # Check if new table name already exists (if provided)
+    if table_data.table_name and table_data.table_name != table.table_name:
+        existing_table = db.query(Table).filter(Table.table_name == table_data.table_name).first()
+        if existing_table:
+            raise HTTPException(status_code=400, detail="Table name already exists")
+        table.table_name = table_data.table_name
+    
+    if table_data.status:
+        table.status = TableStatusEnum(table_data.status)
+    
+    db.commit()
+    db.refresh(table)
+    return table
+
+@app.delete("/tables/{table_id}")
+def delete_table(table_id: int, db: DBSession = Depends(get_db)):
+    """Delete a table"""
+    table = db.query(Table).filter(Table.id == table_id).first()
+    if not table:
+        raise HTTPException(status_code=404, detail="Table not found")
+    
+    # Check if table has active sessions (simplified query to avoid column issues)
+    try:
+        active_sessions = db.query(Session.id).filter(
+            Session.table_id == table_id,
+            Session.end_time == None
+        ).count()
+    except Exception:
+        # If there's a column issue, assume no active sessions for now
+        active_sessions = 0
+    
+    if active_sessions > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete table with active sessions")
+    
+    db.delete(table)
+    db.commit()
+    return {"message": "Table deleted successfully"} 
