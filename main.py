@@ -42,6 +42,7 @@ class RateTypeEnum(str, enum.Enum):
 class TableStatusEnum(str, enum.Enum):
     vacant = "vacant"
     occupied = "occupied"
+    partially_vacant = "partially_vacant"
     reserved = "reserved"
     maintenance = "maintenance"
 
@@ -79,6 +80,12 @@ class Session(Base):
     # Guest session fields
     guest_name = Column(String(100), nullable=True)
     guest_contact = Column(String(15), nullable=True)
+    rate_type = Column(String(50), nullable=True)  # Store rate type for guest sessions
+    # Game session fields
+    game_type = Column(String(50), default="snooker")
+    total_players = Column(Integer, default=1)
+    current_players = Column(Integer, default=1)
+    all_players_data = Column(Text, nullable=True)  # Store all players as JSON
     customer = relationship("Customer", back_populates="sessions")
     table = relationship("Table", back_populates="sessions")
     session_items = relationship("SessionItem", back_populates="session")
@@ -244,8 +251,10 @@ def get_tables(db: DBSession = Depends(get_db)):
 
 @app.get("/tables/available")
 def get_available_tables(db: DBSession = Depends(get_db)):
-    """Get only available (vacant) tables"""
-    tables = db.query(Table).filter(Table.status == TableStatusEnum.vacant).all()
+    """Get available (vacant and partially vacant) tables"""
+    tables = db.query(Table).filter(
+        Table.status.in_([TableStatusEnum.vacant, TableStatusEnum.partially_vacant])
+    ).all()
     return tables
 
 # Session endpoints
@@ -255,6 +264,12 @@ class SessionCreate(BaseModel):
     guest_contact: Optional[str] = None
     table_id: int
     session_type: str  # 'member' or 'guest'
+    rate_type: Optional[str] = None
+    rate_amount: Optional[float] = None
+    game_type: Optional[str] = "snooker"  # snooker, pool, etc.
+    total_players: Optional[int] = 1
+    current_players: Optional[int] = 1
+    all_players: Optional[list] = None
 
 class SessionOut(BaseModel):
     id: int
@@ -282,17 +297,64 @@ def start_session(session_data: SessionCreate, db: DBSession = Depends(get_db)):
     if table.status != TableStatusEnum.vacant:
         raise HTTPException(status_code=400, detail="Table is not available")
     
-    # Create session
+    # Check for existing active session for the same customer
+    if session_data.customer_id:
+        # For member sessions - check by customer_id
+        existing_session = db.query(Session).filter(
+            Session.customer_id == session_data.customer_id,
+            Session.end_time.is_(None)
+        ).first()
+        if existing_session:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Customer already has an active session on Table {existing_session.table_id}"
+            )
+    elif session_data.guest_name and session_data.guest_contact:
+        # For guest sessions - check by guest name and contact
+        existing_session = db.query(Session).filter(
+            Session.guest_name == session_data.guest_name,
+            Session.guest_contact == session_data.guest_contact,
+            Session.end_time.is_(None)
+        ).first()
+        if existing_session:
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Guest '{session_data.guest_name}' already has an active session on Table {existing_session.table_id}"
+            )
+    
+    # Create session with correct time (Pakistani time UTC+5)
+    pakistani_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    
+    # Store all players data as JSON
+    import json
+    all_players_json = json.dumps(session_data.all_players) if session_data.all_players else None
+    
     new_session = Session(
         customer_id=session_data.customer_id,
         table_id=session_data.table_id,
-        start_time=datetime.datetime.utcnow(),
+        start_time=pakistani_time,
         guest_name=session_data.guest_name,
-        guest_contact=session_data.guest_contact
+        guest_contact=session_data.guest_contact,
+        base_rate=session_data.rate_amount,
+        rate_type=session_data.rate_type,
+        game_type=session_data.game_type,
+        total_players=session_data.total_players,
+        current_players=session_data.current_players,
+        all_players_data=all_players_json
     )
     
-    # Update table status
-    table.status = TableStatusEnum.occupied
+    # Update table status based on player count
+    current_players = getattr(session_data, 'current_players', 1)
+    total_players = getattr(session_data, 'total_players', 1)
+    
+    print(f"Debug: current_players={current_players}, total_players={total_players}")
+    
+    if current_players < total_players:
+        table.status = TableStatusEnum.partially_vacant
+        print(f"Debug: Setting table status to partially_vacant")
+    else:
+        table.status = TableStatusEnum.occupied
+        print(f"Debug: Setting table status to occupied")
     
     db.add(new_session)
     db.commit()
@@ -322,8 +384,27 @@ def get_active_sessions(db: DBSession = Depends(get_db)):
             "total_cost": session.total_cost,
             "customer_name": None,
             "customer_contact": None,
-            "rate_type": None
+            "rate_type": None,
+            "rate_amount": session.base_rate,
+            "table_name": None,
+            "game_type": getattr(session, 'game_type', 'snooker'),
+            "total_players": getattr(session, 'total_players', 1),
+            "current_players": getattr(session, 'current_players', 1),
+            "all_players": []
         }
+        
+        # Parse all players data if available
+        if hasattr(session, 'all_players_data') and session.all_players_data:
+            try:
+                import json
+                session_dict["all_players"] = json.loads(session.all_players_data)
+            except:
+                session_dict["all_players"] = []
+        
+        # Get table name
+        table = db.query(Table).filter(Table.id == session.table_id).first()
+        if table:
+            session_dict["table_name"] = table.table_name
         
         # If it's a member session, get customer details
         if session.customer_id:
@@ -332,10 +413,89 @@ def get_active_sessions(db: DBSession = Depends(get_db)):
                 session_dict["customer_name"] = customer.name
                 session_dict["customer_contact"] = customer.contact_number
                 session_dict["rate_type"] = customer.rate_type
+        else:
+            # For guest sessions, use the rate type stored in the session
+            if session.rate_type:
+                session_dict["rate_type"] = session.rate_type
+            else:
+                session_dict["rate_type"] = "Guest"
         
         enriched_sessions.append(session_dict)
     
     return enriched_sessions
+
+@app.post("/sessions/{session_id}/end")
+def end_session(session_id: int, db: DBSession = Depends(get_db)):
+    """End a session and calculate total cost"""
+    session = db.query(Session).filter(Session.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.end_time:
+        raise HTTPException(status_code=400, detail="Session already ended")
+    
+    # Calculate session duration and cost using current time (Pakistani time)
+    pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    duration = pakistani_end_time - session.start_time
+    total_minutes = int(duration.total_seconds() / 60)
+    
+    # Calculate cost based on rate type
+    total_cost = 0
+    if session.base_rate:
+        if session.customer_id:
+            # Member session - get rate type from customer
+            customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+            if customer:
+                rate_type = customer.rate_type
+                rate_amount = customer.rate_amount
+                
+                if rate_type == "hourly":
+                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                    total_cost = hours * rate_amount
+                elif rate_type == "30min":
+                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                    total_cost = blocks * rate_amount
+                elif rate_type == "time played":
+                    total_cost = total_minutes * rate_amount
+        else:
+            # Guest session - use session rate type and amount
+            if session.rate_type:
+                rate_type = session.rate_type
+                rate_amount = session.base_rate
+                
+                if rate_type == "hourly":
+                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                    total_cost = hours * rate_amount
+                elif rate_type == "30min":
+                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                    total_cost = blocks * rate_amount
+                elif rate_type == "time played":
+                    total_cost = total_minutes * rate_amount
+            else:
+                # Default to hourly for guests without rate type
+                hours = max(1, total_minutes / 60)
+                total_cost = hours * session.base_rate
+    
+    # Update session with end time and calculated values
+    session.end_time = pakistani_end_time
+    session.total_minutes = total_minutes
+    session.total_cost = total_cost
+    
+    # Update table status to vacant
+    table = db.query(Table).filter(Table.id == session.table_id).first()
+    if table:
+        table.status = TableStatusEnum.vacant
+    
+    db.commit()
+    
+    return {
+        "message": "Session ended successfully",
+        "session_id": session.id,
+        "total_minutes": total_minutes,
+        "total_cost": total_cost,
+        "end_time": pakistani_end_time,
+        "duration_formatted": f"{total_minutes // 60}h {total_minutes % 60}m" if total_minutes >= 60 else f"{total_minutes}m"
+    }
 
 @app.post("/tables/create-sample")
 def create_sample_tables(db: DBSession = Depends(get_db)):
