@@ -302,9 +302,40 @@ def start_session(session_data: SessionCreate, db: DBSession = Depends(get_db)):
 
 @app.get("/sessions/active")
 def get_active_sessions(db: DBSession = Depends(get_db)):
-    """Get all active sessions"""
+    """Get all active sessions with customer details"""
     sessions = db.query(Session).filter(Session.end_time.is_(None)).all()
-    return sessions
+    
+    # Enrich sessions with customer data
+    enriched_sessions = []
+    for session in sessions:
+        session_dict = {
+            "id": session.id,
+            "table_id": session.table_id,
+            "customer_id": session.customer_id,
+            "guest_name": session.guest_name,
+            "guest_contact": session.guest_contact,
+            "start_time": session.start_time,
+            "end_time": session.end_time,
+            "total_minutes": session.total_minutes,
+            "base_rate": session.base_rate,
+            "discount": session.discount,
+            "total_cost": session.total_cost,
+            "customer_name": None,
+            "customer_contact": None,
+            "rate_type": None
+        }
+        
+        # If it's a member session, get customer details
+        if session.customer_id:
+            customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+            if customer:
+                session_dict["customer_name"] = customer.name
+                session_dict["customer_contact"] = customer.contact_number
+                session_dict["rate_type"] = customer.rate_type
+        
+        enriched_sessions.append(session_dict)
+    
+    return enriched_sessions
 
 @app.post("/tables/create-sample")
 def create_sample_tables(db: DBSession = Depends(get_db)):
