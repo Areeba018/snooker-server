@@ -329,14 +329,23 @@ def start_session(session_data: SessionCreate, db: DBSession = Depends(get_db)):
     import json
     all_players_json = json.dumps(session_data.all_players) if session_data.all_players else None
     
+    # For member sessions, get the rate amount and type from customer record
+    base_rate = session_data.rate_amount
+    rate_type = session_data.rate_type
+    if session_data.customer_id:
+        customer = db.query(Customer).filter(Customer.id == session_data.customer_id).first()
+        if customer:
+            base_rate = customer.rate_amount
+            rate_type = customer.rate_type
+    
     new_session = Session(
         customer_id=session_data.customer_id,
         table_id=session_data.table_id,
         start_time=pakistani_time,
         guest_name=session_data.guest_name,
         guest_contact=session_data.guest_contact,
-        base_rate=session_data.rate_amount,
-        rate_type=session_data.rate_type,
+        base_rate=base_rate,
+        rate_type=rate_type,
         game_type=session_data.game_type,
         total_players=session_data.total_players,
         current_players=session_data.current_players,
@@ -433,121 +442,156 @@ class EndPlayerRequest(BaseModel):
 @app.post("/sessions/{session_id}/end-player")
 def end_player_session(session_id: int, player_data: EndPlayerRequest, db: DBSession = Depends(get_db)):
     """End a specific player's session"""
-    session = db.query(Session).filter(Session.id == session_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    if session.end_time:
-        raise HTTPException(status_code=400, detail="Session already ended")
-    
-    # Get current players data
-    import json
-    current_players_data = []
-    if hasattr(session, 'all_players_data') and session.all_players_data:
-        try:
-            current_players_data = json.loads(session.all_players_data)
-        except:
-            current_players_data = []
-    
-    if player_data.player_index >= len(current_players_data):
-        raise HTTPException(status_code=400, detail="Player index out of range")
-    
-    # Remove the specific player
-    removed_player = current_players_data.pop(player_data.player_index)
-    
-    # Calculate cost for the removed player
-    pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
-    duration = pakistani_end_time - session.start_time
-    total_minutes = int(duration.total_seconds() / 60)
-    
-    # Calculate cost for the removed player
-    player_cost = 0
-    rate_type = removed_player.get('rateType', 'hourly')
-    rate_amount = removed_player.get('rateAmount', session.base_rate or 0)
-    player_type = removed_player.get('playerType', 'guest')
-    
-    # Calculate base cost based on rate type
-    if rate_type == "hourly":
-        hours = max(1, total_minutes / 60)  # Minimum 1 hour
-        player_cost = hours * rate_amount
-    elif rate_type == "30min":
-        blocks = max(1, total_minutes / 30)  # Minimum 1 block
-        player_cost = blocks * rate_amount
-    elif rate_type == "time played":
-        # For time played, rate_amount should be per minute
-        player_cost = total_minutes * rate_amount
-    
-    # Apply discount only for members
-    if player_type == 'member' and removed_player.get('customerId'):
-        customer = db.query(Customer).filter(Customer.id == removed_player.get('customerId')).first()
-        if customer and customer.discount > 0:
-            discount_amount = (player_cost * customer.discount) / 100
-            player_cost = player_cost - discount_amount
-    
-    # Create a new session for the removed player to generate bill
-    removed_player_session = Session(
-        customer_id=None,  # Will be set based on player type
-        table_id=session.table_id,
-        start_time=session.start_time,
-        end_time=pakistani_end_time,
-        total_minutes=total_minutes,
-        base_rate=rate_amount,
-        total_cost=player_cost,
-        guest_name=removed_player.get('name'),  # Always set the name
-        guest_contact=removed_player.get('contact'),  # Always set the contact
-        rate_type=rate_type,
-        game_type=session.game_type
-    )
-    
-    # Set customer_id if it's a member
-    if removed_player.get('playerType') == 'member' and removed_player.get('customerId'):
-        removed_player_session.customer_id = removed_player.get('customerId')
-    
-    db.add(removed_player_session)
-    db.flush()  # Flush to get the session ID
-    
-    # Create bill for the removed player
-    new_bill = Bill(
-        session_id=removed_player_session.id,
-        date_issued=pakistani_end_time,
-        paid=False,
-        notes=f"Individual player session ended - {removed_player.get('name', 'Unknown')}"
-    )
-    db.add(new_bill)
-    
-    # Update session
-    session.all_players_data = json.dumps(current_players_data)
-    session.current_players = len(current_players_data)  # Update to actual count
-    
-    # Update table status
-    table = db.query(Table).filter(Table.id == session.table_id).first()
-    session_ended = False
-    
-    if table:
-        if len(current_players_data) == 0:
-            # No players left, end the entire session
-            session.end_time = pakistani_end_time
-            table.status = TableStatusEnum.vacant
-            session_ended = True
-        elif len(current_players_data) == 1:
-            # Only one player left, keep session active but mark as partially vacant
-            table.status = TableStatusEnum.partially_vacant
+    try:
+        print(f"DEBUG: End player session called for session_id={session_id}, player_index={player_data.player_index}")
+        
+        session = db.query(Session).filter(Session.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        if session.end_time:
+            raise HTTPException(status_code=400, detail="Session already ended")
+        
+        # Get current players data
+        import json
+        current_players_data = []
+        if hasattr(session, 'all_players_data') and session.all_players_data:
+            try:
+                current_players_data = json.loads(session.all_players_data)
+                print(f"DEBUG: Parsed players data: {current_players_data}")
+            except Exception as e:
+                print(f"DEBUG: Error parsing players data: {e}")
+                current_players_data = []
         else:
-            # Multiple players still active
-            table.status = TableStatusEnum.partially_vacant
-    
-    db.commit()
-    
-    return {
-        "message": f"Player {removed_player.get('name', 'Unknown')} session ended successfully",
-        "session_id": session.id,
-        "current_players": session.current_players,
-        "total_players": session.total_players,
-        "session_ended": session_ended,
-        "players_remaining": len(current_players_data),
-        "player_cost": player_cost,
-        "bill_created": True
-    }
+            print(f"DEBUG: No all_players_data found for session {session_id}")
+        
+        print(f"DEBUG: Current players count: {len(current_players_data)}, Requested index: {player_data.player_index}")
+        
+        if player_data.player_index >= len(current_players_data):
+            raise HTTPException(status_code=400, detail=f"Player index {player_data.player_index} out of range. Total players: {len(current_players_data)}")
+        
+        # Remove the specific player
+        removed_player = current_players_data.pop(player_data.player_index)
+        
+        # Calculate cost for the removed player
+        pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+        duration = pakistani_end_time - session.start_time
+        total_minutes = int(duration.total_seconds() / 60)
+        
+        # Calculate cost for the removed player
+        player_cost = 0
+        discount_amount = 0
+        rate_type = removed_player.get('rateType', 'hourly')
+        rate_amount = removed_player.get('rateAmount', session.base_rate or 0)
+        
+        # Convert rate_amount to float if it's a string
+        if isinstance(rate_amount, str):
+            try:
+                rate_amount = float(rate_amount)
+            except ValueError:
+                rate_amount = 0.0
+        
+        player_type = removed_player.get('playerType', 'guest')
+        
+        # Calculate base cost based on rate type
+        if rate_type == "hourly":
+            hours = max(1, total_minutes / 60)  # Minimum 1 hour
+            player_cost = hours * rate_amount
+        elif rate_type == "30min":
+            blocks = max(1, total_minutes / 30)  # Minimum 1 block
+            player_cost = blocks * rate_amount
+        elif rate_type == "time played" or rate_type == "time_played":
+            # For time played, rate_amount should be per minute
+            player_cost = total_minutes * rate_amount
+        
+        # Apply discount only for members
+        if player_type == 'member' and removed_player.get('customerId'):
+            customer = db.query(Customer).filter(Customer.id == removed_player.get('customerId')).first()
+            if customer and customer.discount > 0:
+                discount_amount = (player_cost * customer.discount) / 100
+                player_cost = player_cost - discount_amount
+        
+        # Set customer_id if it's a member
+        customer_id = None
+        guest_name = removed_player.get('name')
+        guest_contact = removed_player.get('contact')
+        
+        if removed_player.get('playerType') == 'member' and removed_player.get('customerId'):
+            customer_id = removed_player.get('customerId')
+            # For members, don't set guest_name and guest_contact
+            guest_name = None
+            guest_contact = None
+            print(f"DEBUG: Setting customer_id={customer_id} for member session")
+        else:
+            print(f"DEBUG: Creating guest session for {removed_player.get('name')}")
+        
+        # Create a new session for the removed player to generate bill
+        removed_player_session = Session(
+            customer_id=customer_id,  # Set customer_id directly
+            table_id=session.table_id,
+            start_time=session.start_time,
+            end_time=pakistani_end_time,
+            total_minutes=total_minutes,
+            base_rate=rate_amount,
+            total_cost=player_cost,
+            discount=discount_amount if player_type == 'member' else 0,
+            guest_name=guest_name,  # Only set for guests
+            guest_contact=guest_contact,  # Only set for guests
+            rate_type=rate_type,
+            game_type=session.game_type
+        )
+        
+        db.add(removed_player_session)
+        db.flush()  # Flush to get the session ID
+        
+        # Create bill for the removed player
+        new_bill = Bill(
+            session_id=removed_player_session.id,
+            date_issued=pakistani_end_time,
+            paid=False,
+            notes=f"Individual player session ended - {removed_player.get('name', 'Unknown')}"
+        )
+        db.add(new_bill)
+        
+        # Update session
+        session.all_players_data = json.dumps(current_players_data)
+        session.current_players = len(current_players_data)  # Update to actual count
+        
+        # Update table status
+        table = db.query(Table).filter(Table.id == session.table_id).first()
+        session_ended = False
+        
+        if table:
+            if len(current_players_data) == 0:
+                # No players left, end the entire session
+                session.end_time = pakistani_end_time
+                table.status = TableStatusEnum.vacant
+                session_ended = True
+            elif len(current_players_data) == 1:
+                # Only one player left, keep session active but mark as partially vacant
+                table.status = TableStatusEnum.partially_vacant
+            else:
+                # Multiple players still active
+                table.status = TableStatusEnum.partially_vacant
+        
+        db.commit()
+        
+        print(f"DEBUG: Successfully ended player session. Session ended: {session_ended}, Players remaining: {len(current_players_data)}")
+        
+        return {
+            "message": f"Player {removed_player.get('name', 'Unknown')} session ended successfully",
+            "session_id": session.id,
+            "current_players": session.current_players,
+            "total_players": session.total_players,
+            "session_ended": session_ended,
+            "players_remaining": len(current_players_data),
+            "player_cost": player_cost,
+            "bill_created": True
+        }
+    except Exception as e:
+        print(f"DEBUG: Error in end_player_session: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/sessions/{session_id}/add-player")
 def add_player_to_session(session_id: int, player_data: AddPlayerRequest, db: DBSession = Depends(get_db)):
@@ -616,6 +660,8 @@ def end_session(session_id: int, db: DBSession = Depends(get_db)):
     
     # Calculate cost based on rate type
     total_cost = 0
+    discount_amount = 0
+    
     if session.base_rate:
         if session.customer_id:
             # Member session - get rate type from customer
@@ -624,27 +670,56 @@ def end_session(session_id: int, db: DBSession = Depends(get_db)):
                 rate_type = customer.rate_type
                 rate_amount = customer.rate_amount
                 
+                # Convert rate_amount to float if it's a string
+                if isinstance(rate_amount, str):
+                    try:
+                        rate_amount = float(rate_amount)
+                    except ValueError:
+                        rate_amount = 0.0
+                
+                # Calculate base cost
                 if rate_type == "hourly":
-                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                    # For hourly: calculate exact hours (no minimum)
+                    hours = total_minutes / 60
                     total_cost = hours * rate_amount
                 elif rate_type == "30min":
-                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                    # For 30min: calculate exact blocks (no minimum)
+                    blocks = total_minutes / 30
                     total_cost = blocks * rate_amount
-                elif rate_type == "time played":
+                elif rate_type == "time played" or rate_type == "time_played":
+                    # For time played: rate_amount is per minute
                     total_cost = total_minutes * rate_amount
+                
+                print(f"DEBUG: Customer {customer.name}, Rate Type: {rate_type}, Rate Amount: {rate_amount}")
+                print(f"DEBUG: Duration: {total_minutes} minutes, Base Cost: {total_cost}")
+                
+                # Apply discount for members
+                if customer.discount > 0:
+                    discount_amount = (total_cost * customer.discount) / 100
+                    total_cost = total_cost - discount_amount
+                    session.discount = discount_amount
+                    print(f"DEBUG: Discount: {customer.discount}%, Discount Amount: {discount_amount}, Final Cost: {total_cost}")
+                else:
+                    print(f"DEBUG: No discount applied, Final Cost: {total_cost}")
+                
+                # Store the base cost before discount for reference
+                session.base_rate = rate_amount
         else:
-            # Guest session - use session rate type and amount
+            # Guest session - use session rate type and amount (no discount)
             if session.rate_type:
                 rate_type = session.rate_type
                 rate_amount = session.base_rate
                 
                 if rate_type == "hourly":
-                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                    # For hourly: calculate exact hours (no minimum)
+                    hours = total_minutes / 60
                     total_cost = hours * rate_amount
                 elif rate_type == "30min":
-                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                    # For 30min: calculate exact blocks (no minimum)
+                    blocks = total_minutes / 30
                     total_cost = blocks * rate_amount
-                elif rate_type == "time played":
+                elif rate_type == "time played" or rate_type == "time_played":
+                    # For time played: rate_amount is per minute
                     total_cost = total_minutes * rate_amount
             else:
                 # Default to hourly for guests without rate type
@@ -708,24 +783,51 @@ def end_complete_session(session_id: int, db: DBSession = Depends(get_db)):
     
     # Calculate total cost for all remaining players
     total_cost = 0
+    total_discount = 0
+    
     if current_players_data:
         for player in current_players_data:
             rate_type = player.get('rateType', 'hourly')
             rate_amount = player.get('rateAmount', session.base_rate or 0)
             
+            # Convert rate_amount to float if it's a string
+            if isinstance(rate_amount, str):
+                try:
+                    rate_amount = float(rate_amount)
+                except ValueError:
+                    rate_amount = 0.0
+            
+            player_type = player.get('playerType', 'guest')
+            
+            # Calculate base cost for this player
+            player_cost = 0
             if rate_type == "hourly":
-                hours = max(1, total_minutes / 60)  # Minimum 1 hour
-                total_cost += hours * rate_amount
+                # For hourly: calculate exact hours (no minimum)
+                hours = total_minutes / 60
+                player_cost = hours * rate_amount
             elif rate_type == "30min":
-                blocks = max(1, total_minutes / 30)  # Minimum 1 block
-                total_cost += blocks * rate_amount
-            elif rate_type == "time played":
-                total_cost += total_minutes * rate_amount
+                # For 30min: calculate exact blocks (no minimum)
+                blocks = total_minutes / 30
+                player_cost = blocks * rate_amount
+            elif rate_type == "time played" or rate_type == "time_played":
+                # For time played: rate_amount is per minute
+                player_cost = total_minutes * rate_amount
+            
+            # Apply discount only for members
+            if player_type == 'member' and player.get('customerId'):
+                customer = db.query(Customer).filter(Customer.id == player.get('customerId')).first()
+                if customer and customer.discount > 0:
+                    discount_amount = (player_cost * customer.discount) / 100
+                    player_cost = player_cost - discount_amount
+                    total_discount += discount_amount
+            
+            total_cost += player_cost
     
     # Update session with end time and calculated values
     session.end_time = pakistani_end_time
     session.total_minutes = total_minutes
     session.total_cost = total_cost
+    session.discount = total_discount
     
     # Create bill for the session
     new_bill = Bill(
@@ -870,6 +972,7 @@ class BillOut(BaseModel):
     total_minutes: Optional[int] = None
     base_rate: Optional[float] = None
     discount: Optional[float] = None
+    discount_percentage: Optional[float] = None
     rate_type: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
@@ -899,6 +1002,7 @@ def get_all_bills(db: DBSession = Depends(get_db)):
             "total_minutes": None,
             "base_rate": None,
             "discount": None,
+            "discount_percentage": None,
             "rate_type": None
         }
         
@@ -923,21 +1027,74 @@ def get_all_bills(db: DBSession = Depends(get_db)):
             
             # Get customer details if it's a member session
             if session.customer_id:
+                print(f"DEBUG BILL CHECK: Session has customer_id = {session.customer_id}")
                 customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+                if customer:
+                    print(f"DEBUG BILL CHECK: Found customer {customer.name}")
+                else:
+                    print(f"DEBUG BILL CHECK: Customer with ID {session.customer_id} not found!")
                 if customer:
                     bill_dict["customer_name"] = customer.name
                     bill_dict["customer_contact"] = customer.contact_number
                     # Use customer's rate type if session doesn't have one
                     if not bill_dict["rate_type"]:
                         bill_dict["rate_type"] = customer.rate_type
+                    # For member sessions, get discount from customer
+                    if customer.discount > 0:
+                        print(f"DEBUG BILL CHECK: Found customer {customer.name} with {customer.discount}% discount")
+                        print(f"DEBUG BILL CHECK: Session customer_id = {session.customer_id}")
+                        print(f"DEBUG BILL CHECK: Session rate_type = {session.rate_type}")
+                        print(f"DEBUG BILL CHECK: Bill rate_type = {bill_dict['rate_type']}")
+                        print(f"DEBUG BILL CHECK: Session total_minutes = {session.total_minutes}")
+                        print(f"DEBUG BILL CHECK: Session base_rate = {session.base_rate}")
+                        # Calculate the actual discount amount applied
+                        if bill_dict["total_minutes"] and bill_dict["base_rate"]:
+                            # Calculate what the base cost would be without discount
+                            rate_type = bill_dict["rate_type"]
+                            total_minutes = bill_dict["total_minutes"]
+                            base_rate = bill_dict["base_rate"]
+                            
+                            # Convert base_rate to float if it's a string
+                            if isinstance(base_rate, str):
+                                try:
+                                    base_rate = float(base_rate)
+                                except ValueError:
+                                    base_rate = 0.0
+                            
+                            base_cost = 0
+                            
+                            if rate_type == "hourly":
+                                hours = total_minutes / 60
+                                base_cost = hours * base_rate
+                            elif rate_type == "30min":
+                                blocks = total_minutes / 30
+                                base_cost = blocks * base_rate
+                            elif rate_type == "time played" or rate_type == "time_played":
+                                base_cost = total_minutes * base_rate
+                            
+                            # Calculate discount amount
+                            discount_amount = (base_cost * customer.discount) / 100
+                            bill_dict["discount"] = discount_amount
+                            bill_dict["discount_percentage"] = customer.discount
+                            
+                            # Recalculate total cost correctly
+                            bill_dict["total_cost"] = base_cost - discount_amount
+                            
+                            print(f"DEBUG BILL: Customer {customer.name}")
+                            print(f"DEBUG BILL: Duration {total_minutes}min, Rate {rate_type} ${bill_dict['base_rate']}")
+                            print(f"DEBUG BILL: Base Cost ${base_cost}, Discount {customer.discount}% = ${discount_amount}")
+                            print(f"DEBUG BILL: Final Cost ${bill_dict['total_cost']}")
             else:
                 # For guest sessions, use guest name and contact
                 if session.guest_name:
                     bill_dict["customer_name"] = session.guest_name
                     bill_dict["customer_contact"] = session.guest_contact or "N/A"
-                # For guest sessions, ensure rate type is set
+                # For guest sessions, ensure rate type is set and no discount
                 if not bill_dict["rate_type"]:
                     bill_dict["rate_type"] = "hourly"  # Default for guests
+                # Ensure guests have no discount
+                bill_dict["discount"] = None
+                bill_dict["discount_percentage"] = None
         
         enriched_bills.append(bill_dict)
     
@@ -958,85 +1115,290 @@ def mark_bill_as_paid(bill_id: int, db: DBSession = Depends(get_db)):
     
     return {"message": "Bill marked as paid successfully"}
 
-# Auto-create bill when session ends
-@app.post("/sessions/{session_id}/end")
-def end_session(session_id: int, db: DBSession = Depends(get_db)):
-    """End a session and calculate total cost"""
-    session = db.query(Session).filter(Session.id == session_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+@app.post("/fix-member-sessions")
+def fix_member_sessions(db: DBSession = Depends(get_db)):
+    """Fix all member sessions that have NULL customer_id"""
+    # Get all member customers
+    member_customers = db.query(Customer).filter(Customer.customer_type == "member").all()
     
-    if session.end_time:
-        raise HTTPException(status_code=400, detail="Session already ended")
+    total_fixed = 0
+    fixed_details = []
     
-    # Calculate session duration and cost using current time (Pakistani time)
-    pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
-    duration = pakistani_end_time - session.start_time
-    total_minutes = int(duration.total_seconds() / 60)
-    
-    # Calculate cost based on rate type
-    total_cost = 0
-    if session.base_rate:
-        if session.customer_id:
-            # Member session - get rate type from customer
-            customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
-            if customer:
-                rate_type = customer.rate_type
-                rate_amount = customer.rate_amount
-                
-                if rate_type == "hourly":
-                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
-                    total_cost = hours * rate_amount
-                elif rate_type == "30min":
-                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
-                    total_cost = blocks * rate_amount
-                elif rate_type == "time played":
-                    total_cost = total_minutes * rate_amount
-        else:
-            # Guest session - use session rate type and amount
-            if session.rate_type:
-                rate_type = session.rate_type
-                rate_amount = session.base_rate
-                
-                if rate_type == "hourly":
-                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
-                    total_cost = hours * rate_amount
-                elif rate_type == "30min":
-                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
-                    total_cost = blocks * rate_amount
-                elif rate_type == "time played":
-                    total_cost = total_minutes * rate_amount
-            else:
-                # Default to hourly for guests without rate type
-                hours = max(1, total_minutes / 60)
-                total_cost = hours * session.base_rate
-    
-    # Update session with end time and calculated values
-    session.end_time = pakistani_end_time
-    session.total_minutes = total_minutes
-    session.total_cost = total_cost
-    
-    # Create bill for the session
-    new_bill = Bill(
-        session_id=session.id,
-        date_issued=pakistani_end_time,
-        paid=False,
-        notes=None
-    )
-    db.add(new_bill)
-    
-    # Update table status to vacant
-    table = db.query(Table).filter(Table.id == session.table_id).first()
-    if table:
-        table.status = TableStatusEnum.vacant
+    for customer in member_customers:
+        # Find sessions with guest_name matching customer name but customer_id=NULL
+        sessions_to_fix = db.query(Session).filter(
+            Session.guest_name == customer.name,
+            Session.customer_id.is_(None)
+        ).all()
+        
+        if sessions_to_fix:
+            for session in sessions_to_fix:
+                session.customer_id = customer.id
+                session.guest_name = None  # Clear guest name since it's now a member session
+                session.guest_contact = None  # Clear guest contact
+                total_fixed += 1
+            
+            fixed_details.append(f"{customer.name}: {len(sessions_to_fix)} sessions")
     
     db.commit()
     
     return {
-        "message": "Session ended successfully",
-        "session_id": session.id,
-        "total_minutes": total_minutes,
-        "total_cost": total_cost,
-        "end_time": pakistani_end_time,
-        "duration_formatted": f"{total_minutes // 60}h {total_minutes % 60}m" if total_minutes >= 60 else f"{total_minutes}m"
-    } 
+        "message": f"Fixed {total_fixed} member sessions total",
+        "fixed_sessions": total_fixed,
+        "details": fixed_details
+    }
+
+# Reports endpoints
+@app.get("/reports/today")
+def get_today_report(db: DBSession = Depends(get_db)):
+    """Get today's player report"""
+    # Get today's date in Pakistani time
+    today = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    today_start = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+    
+    # Get all sessions that ended today
+    sessions = db.query(Session).filter(
+        Session.end_time >= today_start,
+        Session.end_time <= today_end
+    ).all()
+    
+    report_data = []
+    for session in sessions:
+        # Get player name
+        player_name = "Guest"
+        player_type = "guest"
+        if session.customer_id:
+            customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+            if customer:
+                player_name = customer.name
+                player_type = "member"
+        elif session.guest_name:
+            player_name = session.guest_name
+            player_type = "guest"
+        
+        # Get table name
+        table_name = "Unknown"
+        table = db.query(Table).filter(Table.id == session.table_id).first()
+        if table:
+            table_name = table.table_name
+        
+        report_data.append({
+            "player_name": player_name,
+            "player_type": player_type,
+            "table_name": table_name,
+            "start_time": session.start_time,
+            "end_time": session.end_time,
+            "amount_paid": session.total_cost or 0
+        })
+    
+    return report_data
+
+@app.get("/reports/custom-range")
+def get_custom_range_report(
+    start_date: str,
+    end_date: str,
+    player_type: str = "all",
+    table_id: str = "all",
+    rate_type: str = "all",
+    db: DBSession = Depends(get_db)
+):
+    """Get custom date range report with filters"""
+    # Parse dates
+    start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.datetime.strptime(end_date, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+    
+    # Convert to Pakistani time
+    start = start + datetime.timedelta(hours=5)
+    end = end + datetime.timedelta(hours=5)
+    
+    # Build query
+    query = db.query(Session).filter(
+        Session.end_time >= start,
+        Session.end_time <= end
+    )
+    
+    # Apply filters
+    if player_type == "member":
+        query = query.filter(Session.customer_id.isnot(None))
+    elif player_type == "guest":
+        query = query.filter(Session.customer_id.is_(None))
+    
+    if table_id != "all":
+        query = query.filter(Session.table_id == int(table_id))
+    
+    if rate_type != "all":
+        query = query.filter(Session.rate_type == rate_type)
+    
+    sessions = query.all()
+    
+    report_data = []
+    for session in sessions:
+        # Get player name
+        player_name = "Guest"
+        player_type = "guest"
+        if session.customer_id:
+            customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+            if customer:
+                player_name = customer.name
+                player_type = "member"
+        elif session.guest_name:
+            player_name = session.guest_name
+            player_type = "guest"
+        
+        # Get table name
+        table_name = "Unknown"
+        table = db.query(Table).filter(Table.id == session.table_id).first()
+        if table:
+            table_name = table.table_name
+        
+        report_data.append({
+            "player_name": player_name,
+            "player_type": player_type,
+            "table_name": table_name,
+            "rate_type": session.rate_type or "Unknown",
+            "start_time": session.start_time,
+            "end_time": session.end_time,
+            "amount_paid": session.total_cost or 0
+        })
+    
+    return report_data
+
+@app.get("/reports/daily-summary")
+def get_daily_summary_report(
+    start_date: str,
+    end_date: str,
+    db: DBSession = Depends(get_db)
+):
+    """Get daily summary report"""
+    # Parse dates
+    start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.datetime.strptime(end_date, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+    
+    # Convert to Pakistani time
+    start = start + datetime.timedelta(hours=5)
+    end = end + datetime.timedelta(hours=5)
+    
+    # Get all sessions in date range
+    sessions = db.query(Session).filter(
+        Session.end_time >= start,
+        Session.end_time <= end
+    ).all()
+    
+    # Group by date
+    daily_data = {}
+    for session in sessions:
+        date_key = session.end_time.date()
+        if date_key not in daily_data:
+            daily_data[date_key] = {
+                "total_players": 0,
+                "total_duration": 0,
+                "revenue": 0,
+                "table_usage": {}
+            }
+        
+        daily_data[date_key]["total_players"] += 1
+        daily_data[date_key]["revenue"] += session.total_cost or 0
+        
+        # Calculate duration
+        if session.start_time and session.end_time:
+            duration = session.end_time - session.start_time
+            daily_data[date_key]["total_duration"] += duration.total_seconds() / 60  # in minutes
+        
+        # Track table usage
+        table_name = "Unknown"
+        table = db.query(Table).filter(Table.id == session.table_id).first()
+        if table:
+            table_name = table.table_name
+        
+        if table_name not in daily_data[date_key]["table_usage"]:
+            daily_data[date_key]["table_usage"][table_name] = 0
+        daily_data[date_key]["table_usage"][table_name] += 1
+    
+    # Convert to list format
+    summary_data = []
+    for date, data in daily_data.items():
+        # Find most active table
+        most_active_table = max(data["table_usage"].items(), key=lambda x: x[1])[0] if data["table_usage"] else "None"
+        
+        # Format duration
+        total_hours = int(data["total_duration"] // 60)
+        total_mins = int(data["total_duration"] % 60)
+        duration_str = f"{total_hours}h {total_mins}m" if total_hours > 0 else f"{total_mins}m"
+        
+        summary_data.append({
+            "date": date.isoformat(),
+            "total_players": data["total_players"],
+            "total_duration": duration_str,
+            "revenue": data["revenue"],
+            "most_active_table": most_active_table
+        })
+    
+    # Sort by date
+    summary_data.sort(key=lambda x: x["date"])
+    return summary_data
+
+@app.get("/reports/table-usage")
+def get_table_usage_report(
+    start_date: str,
+    end_date: str,
+    db: DBSession = Depends(get_db)
+):
+    """Get table usage report"""
+    # Parse dates
+    start = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.datetime.strptime(end_date, "%Y-%m-%d") + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+    
+    # Convert to Pakistani time
+    start = start + datetime.timedelta(hours=5)
+    end = end + datetime.timedelta(hours=5)
+    
+    # Get all tables
+    tables = db.query(Table).all()
+    
+    # Calculate total time period
+    total_period_minutes = (end - start).total_seconds() / 60
+    
+    report_data = []
+    for table in tables:
+        # Get sessions for this table
+        sessions = db.query(Session).filter(
+            Session.table_id == table.id,
+            Session.end_time >= start,
+            Session.end_time <= end
+        ).all()
+        
+        total_sessions = len(sessions)
+        total_duration = 0
+        
+        for session in sessions:
+            if session.start_time and session.end_time:
+                duration = session.end_time - session.start_time
+                total_duration += duration.total_seconds() / 60
+        
+        # Calculate usage percentage
+        usage_percentage = (total_duration / total_period_minutes) * 100 if total_period_minutes > 0 else 0
+        usage_percentage = min(usage_percentage, 100)  # Cap at 100%
+        
+        # Calculate idle time
+        idle_minutes = total_period_minutes - total_duration
+        idle_hours = int(idle_minutes // 60)
+        idle_mins = int(idle_minutes % 60)
+        idle_time = f"{idle_hours}h {idle_mins}m" if idle_hours > 0 else f"{idle_mins}m"
+        
+        # Format total duration
+        total_hours = int(total_duration // 60)
+        total_mins = int(total_duration % 60)
+        duration_str = f"{total_hours}h {total_mins}m" if total_hours > 0 else f"{total_mins}m"
+        
+        report_data.append({
+            "table_name": table.table_name,
+            "total_sessions": total_sessions,
+            "total_duration": duration_str,
+            "idle_time": idle_time,
+            "usage_percentage": round(usage_percentage, 1)
+        })
+    
+    return report_data
+
+ 
