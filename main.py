@@ -424,6 +424,181 @@ def get_active_sessions(db: DBSession = Depends(get_db)):
     
     return enriched_sessions
 
+class AddPlayerRequest(BaseModel):
+    player: dict
+
+class EndPlayerRequest(BaseModel):
+    player_index: int
+
+@app.post("/sessions/{session_id}/end-player")
+def end_player_session(session_id: int, player_data: EndPlayerRequest, db: DBSession = Depends(get_db)):
+    """End a specific player's session"""
+    session = db.query(Session).filter(Session.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.end_time:
+        raise HTTPException(status_code=400, detail="Session already ended")
+    
+    # Get current players data
+    import json
+    current_players_data = []
+    if hasattr(session, 'all_players_data') and session.all_players_data:
+        try:
+            current_players_data = json.loads(session.all_players_data)
+        except:
+            current_players_data = []
+    
+    if player_data.player_index >= len(current_players_data):
+        raise HTTPException(status_code=400, detail="Player index out of range")
+    
+    # Remove the specific player
+    removed_player = current_players_data.pop(player_data.player_index)
+    
+    # Calculate cost for the removed player
+    pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    duration = pakistani_end_time - session.start_time
+    total_minutes = int(duration.total_seconds() / 60)
+    
+    # Calculate cost for the removed player
+    player_cost = 0
+    rate_type = removed_player.get('rateType', 'hourly')
+    rate_amount = removed_player.get('rateAmount', session.base_rate or 0)
+    player_type = removed_player.get('playerType', 'guest')
+    
+    # Calculate base cost based on rate type
+    if rate_type == "hourly":
+        hours = max(1, total_minutes / 60)  # Minimum 1 hour
+        player_cost = hours * rate_amount
+    elif rate_type == "30min":
+        blocks = max(1, total_minutes / 30)  # Minimum 1 block
+        player_cost = blocks * rate_amount
+    elif rate_type == "time played":
+        # For time played, rate_amount should be per minute
+        player_cost = total_minutes * rate_amount
+    
+    # Apply discount only for members
+    if player_type == 'member' and removed_player.get('customerId'):
+        customer = db.query(Customer).filter(Customer.id == removed_player.get('customerId')).first()
+        if customer and customer.discount > 0:
+            discount_amount = (player_cost * customer.discount) / 100
+            player_cost = player_cost - discount_amount
+    
+    # Create a new session for the removed player to generate bill
+    removed_player_session = Session(
+        customer_id=None,  # Will be set based on player type
+        table_id=session.table_id,
+        start_time=session.start_time,
+        end_time=pakistani_end_time,
+        total_minutes=total_minutes,
+        base_rate=rate_amount,
+        total_cost=player_cost,
+        guest_name=removed_player.get('name'),  # Always set the name
+        guest_contact=removed_player.get('contact'),  # Always set the contact
+        rate_type=rate_type,
+        game_type=session.game_type
+    )
+    
+    # Set customer_id if it's a member
+    if removed_player.get('playerType') == 'member' and removed_player.get('customerId'):
+        removed_player_session.customer_id = removed_player.get('customerId')
+    
+    db.add(removed_player_session)
+    db.flush()  # Flush to get the session ID
+    
+    # Create bill for the removed player
+    new_bill = Bill(
+        session_id=removed_player_session.id,
+        date_issued=pakistani_end_time,
+        paid=False,
+        notes=f"Individual player session ended - {removed_player.get('name', 'Unknown')}"
+    )
+    db.add(new_bill)
+    
+    # Update session
+    session.all_players_data = json.dumps(current_players_data)
+    session.current_players = len(current_players_data)  # Update to actual count
+    
+    # Update table status
+    table = db.query(Table).filter(Table.id == session.table_id).first()
+    session_ended = False
+    
+    if table:
+        if len(current_players_data) == 0:
+            # No players left, end the entire session
+            session.end_time = pakistani_end_time
+            table.status = TableStatusEnum.vacant
+            session_ended = True
+        elif len(current_players_data) == 1:
+            # Only one player left, keep session active but mark as partially vacant
+            table.status = TableStatusEnum.partially_vacant
+        else:
+            # Multiple players still active
+            table.status = TableStatusEnum.partially_vacant
+    
+    db.commit()
+    
+    return {
+        "message": f"Player {removed_player.get('name', 'Unknown')} session ended successfully",
+        "session_id": session.id,
+        "current_players": session.current_players,
+        "total_players": session.total_players,
+        "session_ended": session_ended,
+        "players_remaining": len(current_players_data),
+        "player_cost": player_cost,
+        "bill_created": True
+    }
+
+@app.post("/sessions/{session_id}/add-player")
+def add_player_to_session(session_id: int, player_data: AddPlayerRequest, db: DBSession = Depends(get_db)):
+    """Add a new player to an existing session"""
+    session = db.query(Session).filter(Session.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.end_time:
+        raise HTTPException(status_code=400, detail="Cannot add player to ended session")
+    
+    # Check if session is full
+    current_players = getattr(session, 'current_players', 1)
+    total_players = getattr(session, 'total_players', 1)
+    
+    if current_players >= total_players:
+        raise HTTPException(status_code=400, detail="Session is already full")
+    
+    # Get current players data
+    import json
+    current_players_data = []
+    if hasattr(session, 'all_players_data') and session.all_players_data:
+        try:
+            current_players_data = json.loads(session.all_players_data)
+        except:
+            current_players_data = []
+    
+    # Add new player
+    new_player = player_data.player
+    current_players_data.append(new_player)
+    
+    # Update session
+    session.all_players_data = json.dumps(current_players_data)
+    session.current_players = current_players + 1
+    
+    # Update table status
+    table = db.query(Table).filter(Table.id == session.table_id).first()
+    if table and session.current_players >= session.total_players:
+        table.status = TableStatusEnum.occupied
+    elif table and session.current_players < session.total_players:
+        table.status = TableStatusEnum.partially_vacant
+    
+    db.commit()
+    
+    return {
+        "message": "Player added successfully",
+        "session_id": session.id,
+        "current_players": session.current_players,
+        "total_players": session.total_players
+    }
+
 @app.post("/sessions/{session_id}/end")
 def end_session(session_id: int, db: DBSession = Depends(get_db)):
     """End a session and calculate total cost"""
@@ -481,6 +656,15 @@ def end_session(session_id: int, db: DBSession = Depends(get_db)):
     session.total_minutes = total_minutes
     session.total_cost = total_cost
     
+    # Create bill for the session
+    new_bill = Bill(
+        session_id=session.id,
+        date_issued=pakistani_end_time,
+        paid=False,
+        notes="Session ended normally"
+    )
+    db.add(new_bill)
+    
     # Update table status to vacant
     table = db.query(Table).filter(Table.id == session.table_id).first()
     if table:
@@ -494,7 +678,79 @@ def end_session(session_id: int, db: DBSession = Depends(get_db)):
         "total_minutes": total_minutes,
         "total_cost": total_cost,
         "end_time": pakistani_end_time,
-        "duration_formatted": f"{total_minutes // 60}h {total_minutes % 60}m" if total_minutes >= 60 else f"{total_minutes}m"
+        "duration_formatted": f"{total_minutes // 60}h {total_minutes % 60}m" if total_minutes >= 60 else f"{total_minutes}m",
+        "bill_created": True
+    }
+
+@app.post("/sessions/{session_id}/end-complete")
+def end_complete_session(session_id: int, db: DBSession = Depends(get_db)):
+    """End the entire session and generate bill for remaining players"""
+    session = db.query(Session).filter(Session.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.end_time:
+        raise HTTPException(status_code=400, detail="Session already ended")
+    
+    # Get current players data
+    import json
+    current_players_data = []
+    if hasattr(session, 'all_players_data') and session.all_players_data:
+        try:
+            current_players_data = json.loads(session.all_players_data)
+        except:
+            current_players_data = []
+    
+    # Calculate session duration and cost using current time (Pakistani time)
+    pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    duration = pakistani_end_time - session.start_time
+    total_minutes = int(duration.total_seconds() / 60)
+    
+    # Calculate total cost for all remaining players
+    total_cost = 0
+    if current_players_data:
+        for player in current_players_data:
+            rate_type = player.get('rateType', 'hourly')
+            rate_amount = player.get('rateAmount', session.base_rate or 0)
+            
+            if rate_type == "hourly":
+                hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                total_cost += hours * rate_amount
+            elif rate_type == "30min":
+                blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                total_cost += blocks * rate_amount
+            elif rate_type == "time played":
+                total_cost += total_minutes * rate_amount
+    
+    # Update session with end time and calculated values
+    session.end_time = pakistani_end_time
+    session.total_minutes = total_minutes
+    session.total_cost = total_cost
+    
+    # Create bill for the session
+    new_bill = Bill(
+        session_id=session.id,
+        date_issued=pakistani_end_time,
+        paid=False,
+        notes=f"Session ended - {len(current_players_data)} players completed"
+    )
+    db.add(new_bill)
+    
+    # Update table status to vacant
+    table = db.query(Table).filter(Table.id == session.table_id).first()
+    if table:
+        table.status = TableStatusEnum.vacant
+    
+    db.commit()
+    
+    return {
+        "message": "Session ended successfully",
+        "session_id": session.id,
+        "total_minutes": total_minutes,
+        "total_cost": total_cost,
+        "end_time": pakistani_end_time,
+        "players_count": len(current_players_data),
+        "bill_created": True
     }
 
 @app.post("/tables/create-sample")
@@ -593,4 +849,194 @@ def delete_table(table_id: int, db: DBSession = Depends(get_db)):
     
     db.delete(table)
     db.commit()
-    return {"message": "Table deleted successfully"} 
+    return {"message": "Table deleted successfully"}
+
+# Billing endpoints
+class BillOut(BaseModel):
+    id: int
+    session_id: int
+    date_issued: datetime.datetime
+    paid: bool
+    notes: Optional[str] = None
+    total_cost: Optional[float] = None
+    customer_name: Optional[str] = None
+    customer_contact: Optional[str] = None
+    guest_name: Optional[str] = None
+    guest_contact: Optional[str] = None
+    table_name: Optional[str] = None
+    table_id: Optional[int] = None
+    start_time: Optional[datetime.datetime] = None
+    end_time: Optional[datetime.datetime] = None
+    total_minutes: Optional[int] = None
+    base_rate: Optional[float] = None
+    discount: Optional[float] = None
+    rate_type: Optional[str] = None
+    
+    model_config = ConfigDict(from_attributes=True)
+
+@app.get("/bills", response_model=List[BillOut])
+def get_all_bills(db: DBSession = Depends(get_db)):
+    """Get all bills with session and customer details"""
+    bills = db.query(Bill).all()
+    
+    enriched_bills = []
+    for bill in bills:
+        bill_dict = {
+            "id": bill.id,
+            "session_id": bill.session_id,
+            "date_issued": bill.date_issued,
+            "paid": bill.paid,
+            "notes": bill.notes,
+            "total_cost": None,
+            "customer_name": None,
+            "customer_contact": None,
+            "guest_name": None,
+            "guest_contact": None,
+            "table_name": None,
+            "table_id": None,
+            "start_time": None,
+            "end_time": None,
+            "total_minutes": None,
+            "base_rate": None,
+            "discount": None,
+            "rate_type": None
+        }
+        
+        # Get session details
+        session = db.query(Session).filter(Session.id == bill.session_id).first()
+        if session:
+            bill_dict["total_cost"] = session.total_cost
+            bill_dict["start_time"] = session.start_time
+            bill_dict["end_time"] = session.end_time
+            bill_dict["total_minutes"] = session.total_minutes
+            bill_dict["base_rate"] = session.base_rate
+            bill_dict["discount"] = session.discount
+            bill_dict["guest_name"] = session.guest_name
+            bill_dict["guest_contact"] = session.guest_contact
+            bill_dict["rate_type"] = session.rate_type
+            
+            # Get table details
+            table = db.query(Table).filter(Table.id == session.table_id).first()
+            if table:
+                bill_dict["table_name"] = table.table_name
+                bill_dict["table_id"] = table.id
+            
+            # Get customer details if it's a member session
+            if session.customer_id:
+                customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+                if customer:
+                    bill_dict["customer_name"] = customer.name
+                    bill_dict["customer_contact"] = customer.contact_number
+                    # Use customer's rate type if session doesn't have one
+                    if not bill_dict["rate_type"]:
+                        bill_dict["rate_type"] = customer.rate_type
+            else:
+                # For guest sessions, use guest name and contact
+                if session.guest_name:
+                    bill_dict["customer_name"] = session.guest_name
+                    bill_dict["customer_contact"] = session.guest_contact or "N/A"
+                # For guest sessions, ensure rate type is set
+                if not bill_dict["rate_type"]:
+                    bill_dict["rate_type"] = "hourly"  # Default for guests
+        
+        enriched_bills.append(bill_dict)
+    
+    return enriched_bills
+
+@app.post("/bills/{bill_id}/pay")
+def mark_bill_as_paid(bill_id: int, db: DBSession = Depends(get_db)):
+    """Mark a bill as paid"""
+    bill = db.query(Bill).filter(Bill.id == bill_id).first()
+    if not bill:
+        raise HTTPException(status_code=404, detail="Bill not found")
+    
+    if bill.paid:
+        raise HTTPException(status_code=400, detail="Bill is already paid")
+    
+    bill.paid = True
+    db.commit()
+    
+    return {"message": "Bill marked as paid successfully"}
+
+# Auto-create bill when session ends
+@app.post("/sessions/{session_id}/end")
+def end_session(session_id: int, db: DBSession = Depends(get_db)):
+    """End a session and calculate total cost"""
+    session = db.query(Session).filter(Session.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    if session.end_time:
+        raise HTTPException(status_code=400, detail="Session already ended")
+    
+    # Calculate session duration and cost using current time (Pakistani time)
+    pakistani_end_time = datetime.datetime.utcnow() + datetime.timedelta(hours=5)
+    duration = pakistani_end_time - session.start_time
+    total_minutes = int(duration.total_seconds() / 60)
+    
+    # Calculate cost based on rate type
+    total_cost = 0
+    if session.base_rate:
+        if session.customer_id:
+            # Member session - get rate type from customer
+            customer = db.query(Customer).filter(Customer.id == session.customer_id).first()
+            if customer:
+                rate_type = customer.rate_type
+                rate_amount = customer.rate_amount
+                
+                if rate_type == "hourly":
+                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                    total_cost = hours * rate_amount
+                elif rate_type == "30min":
+                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                    total_cost = blocks * rate_amount
+                elif rate_type == "time played":
+                    total_cost = total_minutes * rate_amount
+        else:
+            # Guest session - use session rate type and amount
+            if session.rate_type:
+                rate_type = session.rate_type
+                rate_amount = session.base_rate
+                
+                if rate_type == "hourly":
+                    hours = max(1, total_minutes / 60)  # Minimum 1 hour
+                    total_cost = hours * rate_amount
+                elif rate_type == "30min":
+                    blocks = max(1, total_minutes / 30)  # Minimum 1 block
+                    total_cost = blocks * rate_amount
+                elif rate_type == "time played":
+                    total_cost = total_minutes * rate_amount
+            else:
+                # Default to hourly for guests without rate type
+                hours = max(1, total_minutes / 60)
+                total_cost = hours * session.base_rate
+    
+    # Update session with end time and calculated values
+    session.end_time = pakistani_end_time
+    session.total_minutes = total_minutes
+    session.total_cost = total_cost
+    
+    # Create bill for the session
+    new_bill = Bill(
+        session_id=session.id,
+        date_issued=pakistani_end_time,
+        paid=False,
+        notes=None
+    )
+    db.add(new_bill)
+    
+    # Update table status to vacant
+    table = db.query(Table).filter(Table.id == session.table_id).first()
+    if table:
+        table.status = TableStatusEnum.vacant
+    
+    db.commit()
+    
+    return {
+        "message": "Session ended successfully",
+        "session_id": session.id,
+        "total_minutes": total_minutes,
+        "total_cost": total_cost,
+        "end_time": pakistani_end_time,
+        "duration_formatted": f"{total_minutes // 60}h {total_minutes % 60}m" if total_minutes >= 60 else f"{total_minutes}m"
+    } 
