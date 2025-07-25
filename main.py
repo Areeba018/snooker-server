@@ -495,10 +495,10 @@ def end_player_session(session_id: int, player_data: EndPlayerRequest, db: DBSes
         
         # Calculate base cost based on rate type
         if rate_type == "hourly":
-            hours = max(1, total_minutes / 60)  # Minimum 1 hour
+            hours = total_minutes / 60  # Calculate exact hours
             player_cost = hours * rate_amount
         elif rate_type == "30min":
-            blocks = max(1, total_minutes / 30)  # Minimum 1 block
+            blocks = total_minutes / 30  # Calculate exact blocks
             player_cost = blocks * rate_amount
         elif rate_type == "time played" or rate_type == "time_played":
             # For time played, rate_amount should be per minute
@@ -723,7 +723,7 @@ def end_session(session_id: int, db: DBSession = Depends(get_db)):
                     total_cost = total_minutes * rate_amount
             else:
                 # Default to hourly for guests without rate type
-                hours = max(1, total_minutes / 60)
+                hours = total_minutes / 60
                 total_cost = hours * session.base_rate
     
     # Update session with end time and calculated values
@@ -1077,8 +1077,8 @@ def get_all_bills(db: DBSession = Depends(get_db)):
                             bill_dict["discount"] = discount_amount
                             bill_dict["discount_percentage"] = customer.discount
                             
-                            # Recalculate total cost correctly
-                            bill_dict["total_cost"] = base_cost - discount_amount
+                            # Use the original stored total_cost from session, don't recalculate
+                            # bill_dict["total_cost"] = base_cost - discount_amount
                             
                             print(f"DEBUG BILL: Customer {customer.name}")
                             print(f"DEBUG BILL: Duration {total_minutes}min, Rate {rate_type} ${bill_dict['base_rate']}")
@@ -1157,13 +1157,17 @@ def get_today_report(db: DBSession = Depends(get_db)):
     today_start = today.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today.replace(hour=23, minute=59, second=59, microsecond=999999)
     
-    # Get all sessions that ended today
+    # Get all sessions that ended today, but exclude individual player sessions
+    # that were created for billing purposes (they have specific notes)
     sessions = db.query(Session).filter(
         Session.end_time >= today_start,
         Session.end_time <= today_end
     ).all()
     
     report_data = []
+    processed_players = set()  # Track processed players to avoid duplicates
+    player_sessions = {}  # Track all sessions for each player to choose the best one
+    
     for session in sessions:
         # Get player name
         player_name = "Guest"
@@ -1183,16 +1187,64 @@ def get_today_report(db: DBSession = Depends(get_db)):
         if table:
             table_name = table.table_name
         
-        report_data.append({
+        # Create a unique key for this player session to avoid duplicates
+        # Use player name, start time, and end time (ignore amount since it can vary)
+        player_key = f"{player_name}_{session.start_time}_{session.end_time}"
+        
+        # Store all sessions for this player
+        if player_key not in player_sessions:
+            player_sessions[player_key] = []
+        player_sessions[player_key].append({
+            "session": session,
             "player_name": player_name,
             "player_type": player_type,
             "table_name": table_name,
-            "start_time": session.start_time,
-            "end_time": session.end_time,
-            "amount_paid": session.total_cost or 0
+            "amount": session.total_cost or 0
         })
     
-    return report_data
+    # Now process each player and choose the session with the highest amount
+    for player_key, sessions_list in player_sessions.items():
+        # Choose the session with the highest amount (most likely the correct one)
+        best_session_data = max(sessions_list, key=lambda x: x["amount"])
+        session = best_session_data["session"]
+        
+        report_data.append({
+            "player_name": best_session_data["player_name"],
+            "player_type": best_session_data["player_type"],
+            "table_name": best_session_data["table_name"],
+            "start_time": session.start_time,
+            "end_time": session.end_time,
+            "amount_paid": best_session_data["amount"]
+        })
+    
+    # Calculate summary totals
+    total_players = len(report_data)
+    total_revenue = sum(item["amount_paid"] for item in report_data)
+    total_duration_minutes = 0
+    
+    for item in report_data:
+        start_time = item["start_time"]
+        end_time = item["end_time"]
+        if start_time and end_time:
+            duration = end_time - start_time
+            total_duration_minutes += duration.total_seconds() / 60
+    
+    total_hours = int(total_duration_minutes // 60)
+    total_mins = int(total_duration_minutes % 60)
+    total_duration_str = f"{total_hours}h {total_mins}m" if total_hours > 0 else f"{total_mins}m"
+    
+    # Add summary to response
+    summary = {
+        "total_players": total_players,
+        "total_revenue": total_revenue,
+        "total_duration": total_duration_str,
+        "total_sessions": total_players  # Each player represents one session
+    }
+    
+    return {
+        "data": report_data,
+        "summary": summary
+    }
 
 @app.get("/reports/custom-range")
 def get_custom_range_report(
@@ -1233,6 +1285,9 @@ def get_custom_range_report(
     sessions = query.all()
     
     report_data = []
+    processed_players = set()  # Track processed players to avoid duplicates
+    player_sessions = {}  # Track all sessions for each player to choose the best one
+    
     for session in sessions:
         # Get player name
         player_name = "Guest"
@@ -1252,17 +1307,66 @@ def get_custom_range_report(
         if table:
             table_name = table.table_name
         
-        report_data.append({
+        # Create a unique key for this player session to avoid duplicates
+        # Use player name, start time, and end time (ignore amount since it can vary)
+        player_key = f"{player_name}_{session.start_time}_{session.end_time}"
+        
+        # Store all sessions for this player
+        if player_key not in player_sessions:
+            player_sessions[player_key] = []
+        player_sessions[player_key].append({
+            "session": session,
             "player_name": player_name,
             "player_type": player_type,
             "table_name": table_name,
             "rate_type": session.rate_type or "Unknown",
-            "start_time": session.start_time,
-            "end_time": session.end_time,
-            "amount_paid": session.total_cost or 0
+            "amount": session.total_cost or 0
         })
     
-    return report_data
+    # Now process each player and choose the session with the highest amount
+    for player_key, sessions_list in player_sessions.items():
+        # Choose the session with the highest amount (most likely the correct one)
+        best_session_data = max(sessions_list, key=lambda x: x["amount"])
+        session = best_session_data["session"]
+        
+        report_data.append({
+            "player_name": best_session_data["player_name"],
+            "player_type": best_session_data["player_type"],
+            "table_name": best_session_data["table_name"],
+            "rate_type": best_session_data["rate_type"],
+            "start_time": session.start_time,
+            "end_time": session.end_time,
+            "amount_paid": best_session_data["amount"]
+        })
+    
+    # Calculate summary totals
+    total_players = len(report_data)
+    total_revenue = sum(item["amount_paid"] for item in report_data)
+    total_duration_minutes = 0
+    
+    for item in report_data:
+        start_time = item["start_time"]
+        end_time = item["end_time"]
+        if start_time and end_time:
+            duration = end_time - start_time
+            total_duration_minutes += duration.total_seconds() / 60
+    
+    total_hours = int(total_duration_minutes // 60)
+    total_mins = int(total_duration_minutes % 60)
+    total_duration_str = f"{total_hours}h {total_mins}m" if total_hours > 0 else f"{total_mins}m"
+    
+    # Add summary to response
+    summary = {
+        "total_players": total_players,
+        "total_revenue": total_revenue,
+        "total_duration": total_duration_str,
+        "total_sessions": total_players  # Each player represents one session
+    }
+    
+    return {
+        "data": report_data,
+        "summary": summary
+    }
 
 @app.get("/reports/daily-summary")
 def get_daily_summary_report(
@@ -1287,27 +1391,70 @@ def get_daily_summary_report(
     
     # Group by date
     daily_data = {}
+    processed_sessions = set()  # Track processed sessions to avoid duplicates
+    processed_players = set()  # Track processed players to avoid duplicates
+    session_groups = {}  # Group sessions by unique key to choose best amount
+    
     for session in sessions:
-        date_key = session.end_time.date()
+        # Create a unique key for this session to avoid duplicates
+        # Use start time, end time, and table_id (ignore amount since it can vary)
+        session_key = f"{session.start_time}_{session.end_time}_{session.table_id}"
+        
+        # Group sessions by this key to choose the best amount
+        if session_key not in session_groups:
+            session_groups[session_key] = []
+        session_groups[session_key].append(session)
+    
+    # Now process each group and choose the session with the highest amount
+    for session_key, sessions_list in session_groups.items():
+        # Choose the session with the highest amount (most likely the correct one)
+        best_session = max(sessions_list, key=lambda x: x.total_cost or 0)
+        
+        # Skip if we've already processed this session
+        if session_key in processed_sessions:
+            continue
+            
+        processed_sessions.add(session_key)
+        
+        # Get player name for unique player counting
+        player_name = "Guest"
+        if best_session.customer_id:
+            customer = db.query(Customer).filter(Customer.id == best_session.customer_id).first()
+            if customer:
+                player_name = customer.name
+        elif best_session.guest_name:
+            player_name = best_session.guest_name
+        
+        # Create unique player key for this date
+        date_key = best_session.end_time.date()
+        player_key = f"{date_key}_{player_name}"
+        
         if date_key not in daily_data:
             daily_data[date_key] = {
                 "total_players": 0,
                 "total_duration": 0,
                 "revenue": 0,
-                "table_usage": {}
+                "table_usage": {},
+                "unique_players": set()  # Track unique players for this date
             }
         
-        daily_data[date_key]["total_players"] += 1
-        daily_data[date_key]["revenue"] += session.total_cost or 0
+        # Only count player once per date
+        if player_key not in processed_players:
+            daily_data[date_key]["total_players"] += 1
+            processed_players.add(player_key)
+        
+        # Use the highest amount for revenue calculation
+        session_amount = best_session.total_cost or 0
+        daily_data[date_key]["revenue"] += session_amount
         
         # Calculate duration
-        if session.start_time and session.end_time:
-            duration = session.end_time - session.start_time
+        if best_session.start_time and best_session.end_time:
+            duration = best_session.end_time - best_session.start_time
             daily_data[date_key]["total_duration"] += duration.total_seconds() / 60  # in minutes
         
         # Track table usage
         table_name = "Unknown"
-        table = db.query(Table).filter(Table.id == session.table_id).first()
+        table = db.query(Table).filter(Table.id == best_session.table_id).first()
         if table:
             table_name = table.table_name
         
@@ -1368,10 +1515,26 @@ def get_table_usage_report(
             Session.end_time <= end
         ).all()
         
-        total_sessions = len(sessions)
-        total_duration = 0
+        # Filter out duplicate sessions
+        processed_sessions = set()
+        unique_sessions = []
         
         for session in sessions:
+            # Create a unique key for this session to avoid duplicates
+            # Use start time and end time (ignore amount since it can vary)
+            session_key = f"{session.start_time}_{session.end_time}"
+            
+            # Skip if we've already processed this session
+            if session_key in processed_sessions:
+                continue
+                
+            processed_sessions.add(session_key)
+            unique_sessions.append(session)
+        
+        total_sessions = len(unique_sessions)
+        total_duration = 0
+        
+        for session in unique_sessions:
             if session.start_time and session.end_time:
                 duration = session.end_time - session.start_time
                 total_duration += duration.total_seconds() / 60
